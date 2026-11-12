@@ -1312,7 +1312,7 @@ O `vite preview` já devolve o `index.html` para caminhos desconhecidos. **Em de
 - **Back no meio do treino:** sair pelo botão chama `sairParaHome`, que salva o tempo exato do descanso. O back do navegador desmonta o `Workout` sem isso — cai na limitação já conhecida de fechar a aba no descanso (retoma com o descanso cheio).
 - **Refresh em `/treino`:** com progresso salvo do dia, retoma; sem progresso, começa do `ESTADO_INICIAL`. Depois de finalizar, dar F5 em `/treino` inicia um treino novo.
 - **Bundle:** o JS de produção foi de ~249 kB para ~289 kB (gzip ~77 → ~90 kB) por causa do router; sem code splitting por rota ainda.
-- **Sem teste de rotas:** guards/redirects ainda não têm teste automatizado (precisa `MemoryRouter` + Testing Library).
+- **Sem teste de rotas:** na Rodada 11 os guards/redirects ainda não tinham teste automatizado; isso foi resolvido na Rodada 12 (§15).
 
 ### 14.9 Verificação
 
@@ -1322,34 +1322,147 @@ O `vite preview` já devolve o `index.html` para caminhos desconhecidos. **Em de
 
 ---
 
-## 15. Problemas conhecidos (próximos estudos)
+## 15. Rodada 12 — testes de rota com Testing Library
+
+### 15.1 Problema
+
+Os guards de rota da Rodada 11 estavam verificados só manualmente. Uma mudança em `LayoutProtegido`, na ordem das rotas ou no fallback `*` poderia quebrar os redirects sem o `npm test` acusar.
+
+Objetivo: renderizar o `App` de verdade em um router de teste e verificar **para onde cada URL leva**, com e sem usuário.
+
+### 15.2 Setup
+
+```bash
+npm install -D jsdom @testing-library/react @testing-library/dom @testing-library/jest-dom
+```
+
+Versões instaladas: `jsdom` 29, `@testing-library/react` 16, `@testing-library/dom` 10, `@testing-library/jest-dom` 7.
+
+`vitest.config.js`:
+
+```js
+export default defineConfig({
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.js'],
+    include: ['src/**/*.test.{js,jsx}'],
+  },
+})
+```
+
+`src/test/setup.js`:
+
+```js
+import '@testing-library/jest-dom/vitest'
+import { cleanup } from '@testing-library/react'
+import { afterEach } from 'vitest'
+
+afterEach(() => {
+  cleanup()
+  localStorage.clear()
+})
+```
+
+Por que cada peça:
+
+- **`environment: 'jsdom'`** cria `document`, `window` e `localStorage` no Node. Sem isso, `render` não tem onde montar o DOM.
+- **`setupFiles`** roda antes de cada arquivo de teste. `@testing-library/jest-dom/vitest` adiciona matchers como `toBeInTheDocument`.
+- **`cleanup()`** desmonta a árvore React entre testes; sem isso um teste veria o DOM do anterior.
+- **`localStorage.clear()`** evita que o usuário semeado em um teste vaze para o próximo.
+- **`include` com `{js,jsx}`**: o padrão antigo (`*.test.js`) não pegaria `App.test.jsx`.
+
+Alternativa ao jsdom global: colocar `// @vitest-environment jsdom` no topo de cada arquivo que precisa de DOM. Aqui o global foi mais simples — os testes de funções puras continuam passando iguais.
+
+### 15.3 Renderizando o `App` com `MemoryRouter`
+
+```jsx
+function renderizarApp(rota) {
+  return render(
+    <MemoryRouter initialEntries={[rota]}>
+      <App />
+    </MemoryRouter>
+  )
+}
+
+function autenticar() {
+  localStorage.setItem('fitapp_user', JSON.stringify(USUARIO))
+}
+```
+
+- **`MemoryRouter`** guarda o histórico em memória e aceita `initialEntries`; ele **não** altera a URL do navegador. É o equivalente de teste ao `BrowserRouter`.
+- O `App` é renderizado dentro do router porque usa `useNavigate` e contém `<Routes>`.
+- **Semear o `localStorage` antes do `render`** é essencial: `useLocalStorage` lê o valor inicial de forma síncrona dentro do `useState(() => ...)`. Se o `setItem` vier depois, a home já montou sem usuário.
+- O jsdom fornece `localStorage`, então não é preciso mockar o hook.
+
+### 15.4 Redirect é assíncrono
+
+`<Navigate>` dispara a navegação em um efeito, não durante o primeiro render. Por isso a asserção usa `findBy...`, que espera o elemento aparecer:
+
+```js
+expect(
+  await screen.findByRole('heading', { name: /vamos te conhecer/i })
+).toBeInTheDocument()
+```
+
+`getBy...` síncrono falharia porque o redirect ainda não aconteceu. `findBy...` é `getBy...` + `waitFor` por baixo.
+
+### 15.5 Casos cobertos (`src/App.test.jsx`)
+
+| Entrada | Usuário? | Resultado esperado |
+|---|---|---|
+| `/onboarding` | não | formulário "Vamos te conhecer" + input `Nome` |
+| `/onboarding` | sim | redireciona para `/` → "Olá, Ana!" |
+| `/` | não | redireciona para `/onboarding` |
+| `/plano` | não | redireciona para `/onboarding` |
+| `/treino` | não | redireciona para `/onboarding` |
+| `/rota-que-nao-existe` | sim | redireciona para `/` |
+| `/rota-que-nao-existe` | não | redireciona para `/onboarding` |
+
+As asserções usam o heading (`getByRole('heading', ...)`) em vez de texto solto: é o que um leitor de tela anuncia e é menos frágil a mudanças de estilo.
+
+### 15.6 Resultado
+
+- **87 testes em 8 arquivos** (80 anteriores + 7 de rota), passando em ~1,9 s;
+- `npm run lint` e `npm run build` passando;
+- build de produção inalterado: testes não entram no bundle.
+
+### 15.7 Limitação
+
+- cobre **render + redirect**, não interações (clicar em "Salvar plano", concluir treino, preencher onboarding);
+- sem cobertura (`@vitest/coverage-v8`) e sem CI;
+- o ambiente jsdom agora vale para todos os testes; se o custo crescer, separar por arquivo com `@vitest-environment node`.
+
+---
+
+## 16. Problemas conhecidos (próximos estudos)
 
 1. **Treino fixo.** `data/exercicios.js` é sempre o mesmo, independente dos dias/frequência/IMC. → gerar plano a partir do perfil.
-2. **Rotas sem teste e histórico ainda cru.** Guards/redirects não têm teste; back no meio do treino não salva o tempo exato. → `MemoryRouter` + Testing Library; decidir `replace` no "voltar".
+2. **Histórico ainda cru.** Rotas já têm teste, mas o back no meio do treino não salva o tempo exato. → decidir `replace` no "voltar" e tratar `popstate`.
 3. **Dados legados fora da faixa.** `MeuPlano` ainda calcula IMC de usuários salvos antes da validação (a guarda só checa `> 0`). → saneamento/migração ao carregar.
-4. **Testes só de funções puras.** Sem testes de componente/DOM e sem cobertura/CI. → `jsdom` + Testing Library e `@vitest/coverage-v8`.
+4. **Testes de interação ausentes.** Há render/redirect, mas não cliques/fluxos; sem cobertura/CI. → testar `MeuPlano`/`Workout` com `userEvent` e adicionar `@vitest/coverage-v8`.
 5. **`useLocalStorage` não sincroniza entre abas/instâncias** do hook. → ouvir evento `storage`.
 6. **Registro é por dia, não por sessão.** → guardar histórico com data/hora, séries e duração.
 7. **Alertdialog do plano sem focus trap/Escape.** → fechar com Esc e prender o foco.
 8. **Sem dark mode.** → tokens com `@theme` + variante `dark:` no Tailwind v4.
 9. **Paleta hardcoded em utilities.** → migrar `violet`/`slate` para tokens semânticos no `@theme` quando houver mais de um tema.
-10. **Fluxo de UI sem teste de integração.** A extração não mudou comportamento, mas telas/fluxos não têm teste automatizado. → Testing Library renderizando `MeuPlano`/`Workout`.
+10. **Fluxos de interação sem teste.** Render/redirect já são testados, mas salvar plano, preencher onboarding e concluir treino ainda dependem de verificação manual. → `userEvent` + Testing Library.
 
 ---
 
-## 16. Como verificar
+## 17. Como verificar
 
 ```bash
 npm run dev        # http://localhost:5173
 npm run lint       # oxlint
-npm test           # vitest run (80 testes)
+npm test           # vitest run (87 testes)
 npm run test:watch # vitest em watch
+npx vitest run src/App.test.jsx # só os testes de rota
 npm run build      # build de produção
 ```
 
 Estado atual: `lint`, `test` e `build` passando.
 
-Checagem manual no `npm run dev`:
+Checagem manual no `npm run dev` (complementar aos testes):
 
 - o fundo fica parado ao rolar (camada `fixed`);
 - alternar os dias atualiza frequência, próximo treino e anel na hora;
@@ -1418,7 +1531,7 @@ console.log(validarFormulario({ nome: 'Mary', peso: '62,5', altura: '168' })) //
 
 ---
 
-## 17. Checklist de estudo
+## 18. Checklist de estudo
 
 - [x] Separar componentes por feature
 - [x] Custom hook (`useLocalStorage`)
@@ -1462,8 +1575,11 @@ console.log(validarFormulario({ nome: 'Mary', peso: '62,5', altura: '168' })) //
 - [x] Guard de rota com layout route + `Navigate replace`
 - [x] URL como fonte da verdade da navegação
 - [ ] `Link`/`NavLink` + `ButtonLink`
-- [ ] Testes de rota com `MemoryRouter`
+- [x] Testes de rota com `MemoryRouter`
 - [x] Testes com Vitest (funções puras)
-- [ ] Testes de componente (jsdom + Testing Library)
+- [x] Testes de componente (jsdom + Testing Library)
+- [x] Seed de `localStorage` antes do render
+- [x] Redirect assíncrono com `findBy...`
+- [ ] Testes de interação (`userEvent`)
 - [ ] Cobertura (`@vitest/coverage-v8`) e CI
 - [ ] Gerar treino a partir do perfil
